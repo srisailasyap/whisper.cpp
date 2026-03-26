@@ -471,7 +471,16 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 #endif
         // default search paths: executable directory, current directory
         search_paths.push_back(get_executable_path());
+#ifdef __QNX__
+        {
+            char cwd[PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd)) != nullptr) {
+                search_paths.push_back(std::string(cwd));
+            }
+        }
+#else
         search_paths.push_back(fs::current_path());
+#endif
     } else {
         search_paths.push_back(fs::u8path(user_search_path));
     }

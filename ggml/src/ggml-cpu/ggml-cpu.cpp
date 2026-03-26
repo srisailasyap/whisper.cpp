@@ -360,6 +360,42 @@ static const char * ggml_backend_cpu_device_get_description(ggml_backend_dev_t d
     return ctx->description.c_str();
 }
 
+#ifdef __QNX__
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/syspage.h>
+static int _qnx_get_memory(size_t *total, size_t *free) {
+    int                 fd;
+    struct stat         st;
+    char                *str = (char *)SYSPAGE_ENTRY(strings)->data;
+    struct asinfo_entry *as  = (struct asinfo_entry *)SYSPAGE_ENTRY(asinfo);
+    unsigned            num;
+
+    *total = *free = 0;
+
+    if ((fd = open("/proc", O_RDONLY)) == -1) {
+        return -1;
+    }
+
+    if (fstat(fd, &st) == -1) {
+        close(fd);
+        return -1;
+    }
+
+    *free = st.st_size;
+    close(fd);
+
+    for (num = SYSPAGE_ENTRY_SIZE(asinfo) / sizeof(*as); num > 0; --num) {
+        if (strcmp(&str[as->name], "ram") == 0) {
+            *total += as->end - as->start + 1;
+        }
+        ++as;
+    }
+
+    return 0;
+}
+#endif
+
 static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
 #ifdef _WIN32
     MEMORYSTATUSEX status;
@@ -367,6 +403,8 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
     GlobalMemoryStatusEx(&status);
     *total = status.ullTotalPhys;
     *free = status.ullAvailPhys;
+#elif defined(__QNX__)
+    _qnx_get_memory(total, free);
 #else
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);

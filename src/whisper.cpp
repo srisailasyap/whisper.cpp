@@ -38,6 +38,14 @@
 #include <codecvt>
 #endif
 
+#if !defined(_MSC_VER)
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #if defined(WHISPER_BIG_ENDIAN)
 template<typename T>
 static T byteswap(T value) {
@@ -3623,6 +3631,69 @@ struct whisper_context_params whisper_context_default_params() {
 
 struct whisper_context * whisper_init_from_file_with_params_no_state(const char * path_model, struct whisper_context_params params) {
     WHISPER_LOG_INFO("%s: loading model from '%s'\n", __func__, path_model);
+
+#if !defined(_MSC_VER)
+    int fd = open(path_model, O_RDONLY);
+    if (fd < 0) {
+        WHISPER_LOG_ERROR("%s: failed to open '%s'\n", __func__, path_model);
+        return nullptr;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        WHISPER_LOG_ERROR("%s: failed to stat '%s'\n", __func__, path_model);
+        close(fd);
+        return nullptr;
+    }
+
+    size_t file_size = st.st_size;
+    void * mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (mapped == MAP_FAILED) {
+        WHISPER_LOG_ERROR("%s: failed to mmap '%s'\n", __func__, path_model);
+        return nullptr;
+    }
+
+    struct mmap_context {
+        uint8_t * data;
+        size_t    size;
+        size_t    offset;
+    };
+
+    mmap_context * mctx = new mmap_context{ (uint8_t *)mapped, file_size, 0 };
+
+    whisper_model_loader loader = {};
+    loader.context = mctx;
+
+    loader.read = [](void * ctx, void * output, size_t read_size) {
+        mmap_context * m = (mmap_context *)ctx;
+        size_t avail = m->size - m->offset;
+        size_t n = read_size < avail ? read_size : avail;
+        memcpy(output, m->data + m->offset, n);
+        m->offset += n;
+        return n;
+    };
+
+    loader.eof = [](void * ctx) {
+        mmap_context * m = (mmap_context *)ctx;
+        return m->offset >= m->size;
+    };
+
+    loader.close = [](void * ctx) {
+        mmap_context * m = (mmap_context *)ctx;
+        munmap(m->data, m->size);
+        delete m;
+    };
+
+    auto wctx = whisper_init_with_params_no_state(&loader, params);
+
+    if (wctx) {
+        wctx->path_model = path_model;
+    }
+
+    return wctx;
+#else
 #ifdef _MSC_VER
     // Convert UTF-8 path to wide string (UTF-16) for Windows, resolving character encoding issues.
     std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
@@ -3656,13 +3727,14 @@ struct whisper_context * whisper_init_from_file_with_params_no_state(const char 
         fin->close();
     };
 
-    auto ctx = whisper_init_with_params_no_state(&loader, params);
+    auto wctx = whisper_init_with_params_no_state(&loader, params);
 
-    if (ctx) {
-        ctx->path_model = path_model;
+    if (wctx) {
+        wctx->path_model = path_model;
     }
 
-    return ctx;
+    return wctx;
+#endif
 }
 
 struct whisper_context * whisper_init_from_buffer_with_params_no_state(void * buffer, size_t buffer_size, struct whisper_context_params params) {
@@ -6116,7 +6188,13 @@ static void whisper_compute_logprobs(
                 const std::vector<float> & logits,
                               const int    n_logits,
                       std::vector<float> & logprobs) {
-    const float logit_max = *std::max_element(logits.begin(), logits.end());
+    float logit_max = -INFINITY;
+    for (int i = 0; i < n_logits; ++i) {
+        if (logits[i] > logit_max) {
+            logit_max = logits[i];
+        }
+    }
+
     float logsumexp = 0.0f;
     for (int i = 0; i < n_logits; ++i) {
         if (logits[i] > -INFINITY) {
@@ -6126,8 +6204,40 @@ static void whisper_compute_logprobs(
     logsumexp = logf(logsumexp) + logit_max;
 
     for (int i = 0; i < n_logits; ++i) {
+        logprobs[i] = (logits[i] > -INFINITY) ? logits[i] - logsumexp : -INFINITY;
+    }
+}
+
+static void whisper_compute_logprobs_and_probs(
+                const std::vector<float> & logits,
+                              const int    n_logits,
+                      std::vector<float> & logprobs,
+                      std::vector<float> & probs) {
+    float logit_max = -INFINITY;
+    for (int i = 0; i < n_logits; ++i) {
+        if (logits[i] > logit_max) {
+            logit_max = logits[i];
+        }
+    }
+
+    float logsumexp = 0.0f;
+    for (int i = 0; i < n_logits; ++i) {
         if (logits[i] > -INFINITY) {
-            logprobs[i] = logits[i] - logsumexp;
+            const float e = expf(logits[i] - logit_max);
+            probs[i] = e;
+            logsumexp += e;
+        } else {
+            probs[i] = 0.0f;
+        }
+    }
+
+    const float log_logsumexp = logf(logsumexp) + logit_max;
+    const float inv_sumexp = 1.0f / logsumexp;
+
+    for (int i = 0; i < n_logits; ++i) {
+        if (logits[i] > -INFINITY) {
+            logprobs[i] = logits[i] - log_logsumexp;
+            probs[i] *= inv_sumexp;
         } else {
             logprobs[i] = -INFINITY;
         }
@@ -7146,8 +7256,7 @@ int whisper_full_with_state(
                     std::vector<float> logprobs(n_logits);
                     std::vector<float> probs(n_logits);
 
-                    whisper_compute_logprobs(state->logits, n_logits, logprobs);
-                    whisper_compute_probs(state->logits, n_logits, logprobs, probs);
+                    whisper_compute_logprobs_and_probs(state->logits, n_logits, logprobs, probs);
                     state->no_speech_prob = probs[whisper_token_nosp(ctx)];
                 }
 
@@ -7225,23 +7334,7 @@ int whisper_full_with_state(
                         }
                     };
 
-                    const int n_threads = std::min(params.n_threads, n_decoders_cur);
-
-                    if (n_threads == 1) {
-                        process();
-                    } else {
-                        std::vector<std::thread> threads(n_threads - 1);
-
-                        for (int t = 0; t < n_threads - 1; ++t) {
-                            threads[t] = std::thread(process);
-                        }
-
-                        process();
-
-                        for (int t = 0; t < n_threads - 1; ++t) {
-                            threads[t].join();
-                        }
-                    }
+                    process();
                 }
 
                 beam_candidates.clear();
